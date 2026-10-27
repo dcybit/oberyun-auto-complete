@@ -1,0 +1,289 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using Microsoft.Win32;
+
+namespace OberyunAuto
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            Console.WriteLine("=========================================");
+            Console.WriteLine("  Oberyun 自动完成课程 Launcher v3.0");
+            Console.WriteLine("=========================================");
+
+            string browserPath = FindDefaultBrowser();
+            if (string.IsNullOrEmpty(browserPath))
+            {
+                Console.WriteLine("[ERROR] No browser found!");
+                Console.ReadKey();
+                return;
+            }
+            string browserName = Path.GetFileNameWithoutExtension(browserPath);
+            Console.WriteLine("[OK] Default browser: " + browserPath);
+
+            KillPort(9222);
+            Thread.Sleep(500);
+
+            string userDataDir = Path.Combine(Path.GetTempPath(), "OberyunAuto_" + browserName);
+            Console.WriteLine("[OK] Profile dir: " + userDataDir);
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = browserPath,
+                Arguments = "--remote-debugging-port=9222 --no-first-run --disable-extensions --user-data-dir=\"" + userDataDir + "\" https://www.oberyun.com/ober/myHome",
+                UseShellExecute = false
+            });
+
+            Console.WriteLine("Browser started! Please login to Oberyun...");
+            Console.WriteLine("Waiting for page load...");
+
+            string script = LoadScript();
+            Console.WriteLine("[OK] Script loaded: " + (script.Length > 0 ? script.Length + " chars" : "EMPTY!"));
+
+            // Track injected tab IDs so we don't re-inject
+            var injectedTabs = new HashSet<string>();
+            bool everInjected = false;
+
+            // Loop FOREVER: poll for oberyun tabs every 3 seconds
+            while (true)
+            {
+                try
+                {
+                    var tabs = GetTabs();
+                    if (tabs != null)
+                    {
+                        foreach (var t in tabs)
+                        {
+                            if (string.IsNullOrEmpty(t.webSocketDebuggerUrl)) continue;
+                            // Only inject into oberyun.com "page" type tabs (skip extensions, devtools)
+                            if (!t.url.Contains("oberyun.com")) continue;
+                            if (t.url.Contains("login")) continue;
+
+                            // Extract tab ID from ws URL: ws://127.0.0.1:9222/devtools/page/<TAB_ID>
+                            int lastSlash = t.webSocketDebuggerUrl.LastIndexOf('/');
+                            string tabId = lastSlash >= 0 ? t.webSocketDebuggerUrl.Substring(lastSlash + 1) : t.webSocketDebuggerUrl;
+
+                            if (injectedTabs.Contains(tabId)) continue;
+
+                            Console.WriteLine("[INJECT] Tab: " + t.url.Substring(0, Math.Min(80, t.url.Length)));
+                            if (InjectScript(t.webSocketDebuggerUrl, script))
+                            {
+                                injectedTabs.Add(tabId);
+                                if (!everInjected)
+                                {
+                                    Console.WriteLine("=========================================");
+                                    Console.WriteLine("  Script injected! Automation running.");
+                                    Console.WriteLine("  Check browser Console (F12) for progress.");
+                                    Console.WriteLine("  Close browser to exit.");
+                                    Console.WriteLine("=========================================");
+                                    everInjected = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { }
+                Thread.Sleep(3000);
+            }
+        }
+
+        static string FindDefaultBrowser()
+        {
+            try
+            {
+                RegistryKey userChoice = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice");
+                if (userChoice == null)
+                    userChoice = Registry.CurrentUser.OpenSubKey(
+                        @"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice");
+
+                if (userChoice != null)
+                {
+                    string progId;
+                    using (userChoice) { progId = userChoice.GetValue("ProgId") as string; }
+
+                    if (!string.IsNullOrEmpty(progId))
+                    {
+                        using var cmdKey = Registry.ClassesRoot.OpenSubKey(progId + @"\shell\open\command");
+                        if (cmdKey != null)
+                        {
+                            string cmd = cmdKey.GetValue(null) as string;
+                            if (!string.IsNullOrEmpty(cmd))
+                            {
+                                string exe = ParseExeFromCommand(cmd);
+                                if (!string.IsNullOrEmpty(exe) && File.Exists(exe))
+                                {
+                                    Console.WriteLine("[REG] Default browser ProgId=" + progId + " -> " + exe);
+                                    return exe;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("[REG] Registry failed: " + ex.Message); }
+
+            Console.WriteLine("[REG] Falling back to known paths...");
+            string[] paths = {
+                @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + @"\Google\Chrome\Application\chrome.exe",
+                @"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + @"\Microsoft\Edge\Application\msedge.exe",
+                @"C:\Program Files\Mozilla Firefox\firefox.exe",
+                @"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+                @"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + @"\BraveSoftware\Brave-Browser\Application\brave.exe",
+            };
+            foreach (var p in paths) if (File.Exists(p)) return p;
+            return null;
+        }
+
+        static string ParseExeFromCommand(string cmd)
+        {
+            if (string.IsNullOrEmpty(cmd)) return null;
+            cmd = cmd.Trim();
+            if (cmd.StartsWith("\""))
+            {
+                int end = cmd.IndexOf('\"', 1);
+                if (end > 0) return cmd.Substring(1, end - 1);
+            }
+            int space = cmd.IndexOf(' ');
+            return space > 0 ? cmd.Substring(0, space) : cmd;
+        }
+
+        static void KillPort(int port)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = "/c for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :" + port + " ^| findstr LISTENING') do taskkill /F /PID %a 2>nul",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                Process.Start(psi)?.WaitForExit(2000);
+            }
+            catch { }
+        }
+
+        static string LoadScript()
+        {
+            string[] searchPaths = {
+                Path.Combine(AppContext.BaseDirectory, "oberyun-auto.js"),
+                @"d:\Code\auto\oberyun-auto.js",
+            };
+            foreach (var p in searchPaths)
+            {
+                try
+                {
+                    string full = Path.GetFullPath(p);
+                    if (File.Exists(full))
+                    {
+                        Console.WriteLine("[OK] Script path: " + full);
+                        return File.ReadAllText(full);
+                    }
+                }
+                catch { }
+            }
+            Console.WriteLine("[WARN] oberyun-auto.js not found!");
+            return "";
+        }
+
+        static System.Collections.Generic.List<TabInfo> GetTabs()
+        {
+            try
+            {
+                using var wc = new HttpClient();
+                var json = wc.GetStringAsync("http://127.0.0.1:9222/json").Result;
+                return JsonSerializer.Deserialize<System.Collections.Generic.List<TabInfo>>(json);
+            }
+            catch { return null; }
+        }
+
+        static bool InjectScript(string wsUrl, string script)
+        {
+            try
+            {
+                using var ws = new ClientWebSocket();
+                ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None).Wait();
+
+                // Step 1: Register script to auto-run on EVERY new document/page navigation
+                // This survives all page redirects/navigations!
+                var registerCmd = new
+                {
+                    id = 1,
+                    method = "Page.addScriptToEvaluateOnNewDocument",
+                    @params = new
+                    {
+                        source = script
+                    }
+                };
+                string json1 = JsonSerializer.Serialize(registerCmd);
+                ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json1)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
+                DrainResponse(ws);
+
+                // Step 2: Also enable Page domain (needed for navigation events)
+                var enableCmd = new { id = 2, method = "Page.enable" };
+                string json2 = JsonSerializer.Serialize(enableCmd);
+                ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json2)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
+                DrainResponse(ws);
+
+                // Step 3: Run immediately on current page too
+                var evalCmd = new
+                {
+                    id = 3,
+                    method = "Runtime.evaluate",
+                    @params = new
+                    {
+                        expression = script,
+                        returnByValue = true,
+                        awaitPromise = true
+                    }
+                };
+                string json3 = JsonSerializer.Serialize(evalCmd);
+                ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json3)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
+                string resp = DrainResponse(ws);
+
+                ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "ok", CancellationToken.None).Wait();
+                Console.WriteLine("[OK] Script registered (persists across navigation)!");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Inject error: " + ex.Message);
+                return false;
+            }
+        }
+
+        static string DrainResponse(ClientWebSocket ws)
+        {
+            var buffer = new byte[262144];
+            using var ms = new MemoryStream();
+            while (true)
+            {
+                var result = ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).Result;
+                ms.Write(buffer, 0, result.Count);
+                if (result.EndOfMessage) break;
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+    }
+
+    class TabInfo
+    {
+        public string url { get; set; }
+        public string webSocketDebuggerUrl { get; set; }
+    }
+}
