@@ -17,7 +17,7 @@ namespace OberyunAuto
         static void Main(string[] args)
         {
             Console.WriteLine("=========================================");
-            Console.WriteLine("  Oberyun 自动完成课程 Launcher v3.0");
+            Console.WriteLine("  Oberyun 自动完成课程 Launcher v3.1");
             Console.WriteLine("=========================================");
 
             string browserPath = FindDefaultBrowser();
@@ -220,44 +220,41 @@ namespace OberyunAuto
                 ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None).Wait();
 
                 // Step 1: Register script to auto-run on EVERY new document/page navigation
-                // This survives all page redirects/navigations!
-                var registerCmd = new
-                {
-                    id = 1,
-                    method = "Page.addScriptToEvaluateOnNewDocument",
-                    @params = new
-                    {
-                        source = script
-                    }
-                };
-                string json1 = JsonSerializer.Serialize(registerCmd);
-                ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json1)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
-                DrainResponse(ws);
+                SendCommand(ws, 1, "Page.addScriptToEvaluateOnNewDocument", new { source = script });
+                WaitForResponse(ws, 1);
 
-                // Step 2: Also enable Page domain (needed for navigation events)
-                var enableCmd = new { id = 2, method = "Page.enable" };
-                string json2 = JsonSerializer.Serialize(enableCmd);
-                ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json2)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
-                DrainResponse(ws);
+                // Step 2: Enable Page domain (needed for navigation events)
+                SendCommand(ws, 2, "Page.enable", new { });
+                WaitForResponse(ws, 2);
 
-                // Step 3: Run immediately on current page too
-                var evalCmd = new
+                // Step 3: Run immediately on current page (awaitPromise=false to avoid timeout)
+                SendCommand(ws, 3, "Runtime.evaluate", new
                 {
-                    id = 3,
-                    method = "Runtime.evaluate",
-                    @params = new
-                    {
-                        expression = script,
-                        returnByValue = true,
-                        awaitPromise = true
-                    }
-                };
-                string json3 = JsonSerializer.Serialize(evalCmd);
-                ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json3)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
-                string resp = DrainResponse(ws);
+                    expression = script,
+                    returnByValue = true,
+                    awaitPromise = false
+                });
+                WaitForResponse(ws, 3);
+
+                // Step 4: Verify script actually started running
+                Thread.Sleep(800);
+                SendCommand(ws, 4, "Runtime.evaluate", new
+                {
+                    expression = "window.__OberyunAutoRunning === true",
+                    returnByValue = true
+                });
+                var verifyResp = WaitForResponse(ws, 4);
+                bool running = verifyResp.Contains("\"value\":true");
 
                 ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "ok", CancellationToken.None).Wait();
-                Console.WriteLine("[OK] Script registered (persists across navigation)!");
+                if (running)
+                {
+                    Console.WriteLine("[OK] Script injected and running!");
+                }
+                else
+                {
+                    Console.WriteLine("[WARN] Script injected but not confirmed running (page may still be loading)");
+                }
                 return true;
             }
             catch (Exception ex)
@@ -267,17 +264,33 @@ namespace OberyunAuto
             }
         }
 
-        static string DrainResponse(ClientWebSocket ws)
+        static void SendCommand(ClientWebSocket ws, int id, string method, object parameters)
+        {
+            var cmd = new { id, method, @params = parameters };
+            string json = JsonSerializer.Serialize(cmd);
+            ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
+        }
+
+        static string WaitForResponse(ClientWebSocket ws, int id)
         {
             var buffer = new byte[262144];
-            using var ms = new MemoryStream();
             while (true)
             {
-                var result = ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).Result;
-                ms.Write(buffer, 0, result.Count);
-                if (result.EndOfMessage) break;
+                using var ms = new MemoryStream();
+                while (true)
+                {
+                    var result = ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).Result;
+                    ms.Write(buffer, 0, result.Count);
+                    if (result.EndOfMessage) break;
+                }
+                string msg = Encoding.UTF8.GetString(ms.ToArray());
+                // Check if this is the response for our command id
+                if (msg.Contains("\"id\":" + id))
+                {
+                    return msg;
+                }
+                // Otherwise it's an event, skip it
             }
-            return Encoding.UTF8.GetString(ms.ToArray());
         }
     }
 
