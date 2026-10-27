@@ -21,7 +21,7 @@
 | 文件 | 说明 |
 |------|------|
 | `OberyunAutoComplete.exe` | 启动器（.NET 8 single-file），启动浏览器并注入脚本 |
-| `oberyun-auto.js` | 自动完成脚本（课程标记完成 + 考试答题）v8.1 |
+| `oberyun-auto.js` | 自动完成脚本（课程标记完成 + 考试答题）v8.3 |
 | `exam-answers.txt` | 考试答案库（已实测 100 分验证） |
 | `oberyun-build/Program.cs` | 启动器源码（v3.1） |
 | `oberyun-build/OberyunAuto.csproj` | 启动器项目文件 |
@@ -36,6 +36,21 @@ dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=
 构建产物 `OberyunAutoComplete.exe` 输出到项目根目录。
 
 ## 版本历史
+
+### v8.3 (脚本)
+- 修复考试无法自动进入：入口页支持「开始答题/开始考试/进入考试/继续答题」多种按钮文案，并自动点击确认弹窗
+- 考试题目可能位于 iframe 内：所有查找/点击改为跨 frame 递归遍历
+- 进入考试失败自动重试 3 轮；也可手动点「开始答题」后由脚本接管答题
+- 考试页识别不再只依赖 URL，同时检测 `.paperContent` DOM
+- 章节资源考试节点识别增强（类型/标题多字段，兼容中文「考试/试卷」）
+- 新增 frame 诊断日志（radio/checkbox/paper 数量），便于定位题目所在框架
+
+### v8.2 (脚本)
+- 登录阶段循环检测课程：未登录或暂未取到课程时持续轮询，不再提前结束
+- 自动识别登录页（URL 含 `login` 或存在密码输入框），在浮窗提示“请输入账号密码登录”
+- 登录完成后自动继续处理课程，无需手动重新运行脚本
+- `Vue $http` 未就绪时无限等待（原为 15 次后退出）
+- 轮询期间静默 API 日志，避免浮窗刷屏
 
 ### v8.1 (脚本) / v3.1 (启动器)
 - 修复课程列表 API 502 等临时错误，增加自动重试机制（每路径最多 3 次，间隔 3 秒）
