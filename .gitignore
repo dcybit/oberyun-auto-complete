@@ -1,0 +1,12 @@
+# Build artifacts
+oberyun-build/bin/
+oberyun-build/obj/
+
+# IDE
+.vscode/
+.vs/
+*.user
+
+# OS
+Thumbs.db
+desktop.ini
