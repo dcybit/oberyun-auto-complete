@@ -1,6 +1,10 @@
 # Build artifacts
 oberyun-build/bin/
 oberyun-build/obj/
+*.pdb
+*.dll
+*.deps.json
+*.runtimeconfig.json
 
 # IDE
 .vscode/
