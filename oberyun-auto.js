@@ -1,12 +1,12 @@
 /**
- * 欧倍尔自动完成课程 v7.0
+ * 欧倍尔自动完成课程 v8.0
  * 
- * v6.0 → v7.0 修复:
- *   1. 考试 q.answer 在考试中为空 → 改用内嵌实测100分答案库 (按题目顺序)
- *   2. 直接改 Vue answers 数据不触发 saveAnswers 保存 → 改用 DOM 点击 ant-radio/checkbox-wrapper
- *   3. 多选快速点击导致 saveAnswers 请求乱序 → 多选每次点击间隔 600ms 并重新查询 DOM
- *   4. 考试检测 /the_paper|exam/ 漏掉 rscType 为空的情况 → 增加 contentType==='the_paper' 判断
- *   5. 交卷确认用单次 DOM click，避免遍历导致卡顿
+ * v7.0 → v8.0 修复:
+ *   1. 课程列表 API 路径 /V2/smltplat/... 前缀错误 → 改为 /smltplat/... (与其他API一致), 并自动回退尝试 /V2/
+ *   2. 添加可视化状态浮窗, 无需打开 F12 控制台即可查看运行进度和错误
+ *   3. getHttp() 优化: 先查 #app 根组件, 再遍历, 提高查找速度和成功率
+ *   4. API 失败时将返回内容显示到浮窗, 便于诊断
+ *   5. 课程列表和章节列表的字段提取增加容错
  */
 
 (() => {
@@ -18,29 +18,48 @@
   window.addEventListener('beforeunload', () => { window.__OberyunAutoRunning = false; });
 
   // ====== 配置 ======
-  // 课程列表 API
-  const COURSE_LIST_API = '/V2/smltplat/course/crsCourseTerm/listLearningCourseTerm';
-  const API_BASE = ''; // Vue $http 已配置好 baseURL
+  // 课程列表 API (实测正确路径带 /V2/ 前缀; 失败时回退尝试不带 /V2/)
+  const COURSE_LIST_APIS = [
+    '/V2/smltplat/course/crsCourseTerm/listLearningCourseTerm',
+    '/smltplat/course/crsCourseTerm/listLearningCourseTerm',
+  ];
 
-  // ====== 动态获取课程列表 ======
-  async function getMyCourses() {
-    const http = getHttp();
-    if (!http) return [];
-    try {
-      const resp = await http.post(COURSE_LIST_API, { pageSize: 100, pageNo: 1 });
-      const d = resp.data || resp;
-      if (!d.success) return [];
-      const records = d.result?.records || [];
-      return records.map(c => ({
-        courseId: c.courseId,
-        courseTermId: c.courseTermId,
-        name: c.crsName || c.name || '未知课程',
-        progress: parseFloat(c.courseSchedule || c.studyProgress || '0'),
-      }));
-    } catch (e) {
-      log('获取课程列表失败: ' + e.message, 'error');
-      return [];
-    }
+  // ====== 可视化状态浮窗 ======
+  let statusEl = null;
+  function ensureStatusPanel() {
+    if (statusEl) return statusEl;
+    const el = document.createElement('div');
+    el.id = '__oberyun_auto_status';
+    el.style.cssText = `
+      position:fixed;right:12px;bottom:12px;z-index:2147483647;
+      width:380px;max-height:420px;overflow-y:auto;
+      background:rgba(20,20,30,0.95);color:#e6e6e6;
+      font:12px/1.6 "Microsoft YaHei",sans-serif;
+      border:1px solid #444;border-radius:8px;
+      box-shadow:0 4px 20px rgba(0,0,0,0.5);
+      padding:10px 12px;user-select:text;
+    `;
+    el.innerHTML = `<div style="font-weight:bold;color:#722ed1;margin-bottom:6px;">🚀 欧倍尔自动完成 v8.0</div>`;
+    const closeBtn = document.createElement('span');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = 'float:right;cursor:pointer;color:#888;font-size:14px;';
+    closeBtn.onclick = () => { el.style.display = 'none'; };
+    el.querySelector('div').appendChild(closeBtn);
+    document.documentElement.appendChild(el);
+    statusEl = el;
+    return el;
+  }
+  function addStatusLine(msg, type = 'info') {
+    const el = ensureStatusPanel();
+    const line = document.createElement('div');
+    const colors = { info: '#e6e6e6', success: '#52c41a', warn: '#faad14', error: '#f5222d', start: '#722ed1', done: '#eb2f96' };
+    line.style.color = colors[type] || '#e6e6e6';
+    line.style.whiteSpace = 'pre-wrap';
+    line.style.wordBreak = 'break-all';
+    const time = new Date().toLocaleTimeString();
+    line.textContent = `[${time}] ${msg}`;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
   }
 
   // ====== 工具 ======
@@ -52,12 +71,25 @@
     const colors = { info: '#1890ff', success: '#52c41a', warn: '#faad14', error: '#f5222d', start: '#722ed1', done: '#eb2f96' };
     const c = colors[type] || '#333';
     console.log(`%c${icons[type] || '📌'} [${time}] ${msg}`, `color:${c};font-weight:bold;`);
+    // 同步到可视化浮窗
+    try { addStatusLine(msg, type); } catch (e) {}
   }
 
   function getHttp() {
+    // 1. 优先从根组件 #app 查找
+    const app = document.querySelector('#app');
+    const appVue = app?.__vue__;
+    if (appVue?.$http) return appVue.$http;
+    if (appVue?.$root?.$http) return appVue.$root.$http;
+    // 2. 遍历所有元素查找 $http
     for (const el of document.querySelectorAll('*')) {
-      if (el.__vue__?.$http) return el.__vue__.$http;
+      const v = el.__vue__;
+      if (v?.$http) return v.$http;
+      if (v?.$root?.$http) return v.$root.$http;
     }
+    // 3. 回退: 查找全局 axios 实例
+    if (window.axios) return window.axios;
+    if (window.Vue?.prototype?.$http) return window.Vue.prototype.$http;
     return null;
   }
 
@@ -78,6 +110,49 @@
       log(`API ${path}: ${e.message}`, 'error');
       return null;
     }
+  }
+
+  // ====== 动态获取课程列表 ======
+  async function getMyCourses() {
+    const http = getHttp();
+    if (!http) return [];
+    const MAX_RETRY = 3; // 每个路径最多重试3次
+    const RETRY_DELAY = 3000; // 重试间隔3秒
+    for (const apiPath of COURSE_LIST_APIS) {
+      for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+        try {
+          log(`尝试课程列表 API: ${apiPath} (第${attempt}次)`, 'info');
+          const resp = await http.post(apiPath, { pageSize: 100, pageNo: 1 });
+          const d = resp.data || resp;
+          if (d && d.success) {
+            const records = (d.result && d.result.records) || d.result || [];
+            if (Array.isArray(records) && records.length > 0) {
+              log(`✅ API 路径有效: ${apiPath} (返回 ${records.length} 门课程)`, 'success');
+              return records.map(c => ({
+                courseId: c.courseId || c.id,
+                courseTermId: c.courseTermId || c.termId || c.courseTermId,
+                name: c.crsName || c.name || c.courseName || '未知课程',
+                progress: parseFloat(c.courseSchedule || c.studyProgress || c.progress || '0'),
+              }));
+            }
+            log(`  API 返回 success 但 records 为空`, 'warn');
+          } else {
+            log(`  API 返回非 success: ${JSON.stringify(d).slice(0, 200)}`, 'warn');
+          }
+          break; // success 但无数据, 不重试, 换下一个路径
+        } catch (e) {
+          const status = e.response?.status || 0;
+          const isRetryable = status === 502 || status === 503 || status === 504 || status === 0;
+          log(`  API ${apiPath} 异常: ${e.message}${isRetryable && attempt < MAX_RETRY ? `, ${RETRY_DELAY/1000}秒后重试` : ''}`, 'warn');
+          if (isRetryable && attempt < MAX_RETRY) {
+            await sleep(RETRY_DELAY);
+          } else {
+            break;
+          }
+        }
+      }
+    }
+    return [];
   }
 
   // ====== 章节遍历 ======
@@ -215,7 +290,7 @@
   // ====== 主流程 ======
   async function run() {
     log('╔══════════════════════════════════════════╗', 'start');
-    log('║  🚀 欧倍尔自动完成课程 v7.0              ║', 'start');
+    log('║  🚀 欧倍尔自动完成课程 v8.0              ║', 'start');
     log('╚══════════════════════════════════════════╝', 'start');
 
     // 等 Vue $http
@@ -265,7 +340,10 @@
         { contentType: 'form' }
       );
 
-      if (!chapResp?.success) { log('❌ 获取章节失败', 'error'); continue; }
+      if (!chapResp?.success) {
+        log(`❌ 获取章节失败: ${JSON.stringify(chapResp).slice(0, 300)}`, 'error');
+        continue;
+      }
 
       const resources = collectResources(chapResp.result || []);
       log(`资源数: ${resources.length}`, 'info');
@@ -287,12 +365,13 @@
 
         if (isExam) {
           examCount++;
-          log('  📝 考试 - 新开标签页打开...');
-          if (window.OberyunAuto && r.contentId && r.id) {
+          log('  📝 考试 - 当前页跳转进入...');
+          if (r.contentId && r.id) {
             const examUrl = `${location.origin}/ober/smltplat/course/courseLearn?courseId=${c.courseId}&chapterId=${r.id}&type=the_paper&contentId=${r.contentId}&courseTermId=${c.courseTermId}`;
-            window.open(examUrl, '_blank');
-            // 等 exe 给新 tab 注入后自动运行
-            await sleep(2000);
+            // 用当前标签页导航(避免新标签页会话丢失), 导航后脚本会自动重新注入并进入考试答题
+            log(`  跳转: ${examUrl}`, 'info');
+            location.href = examUrl;
+            return; // 停止后续执行, 等待导航后脚本重新运行
           } else {
             log('  ⚠️ 跳过考试 (无 contentId)', 'warn');
           }
