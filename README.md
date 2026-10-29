@@ -82,6 +82,10 @@ dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=
 - 多选题每次点击间隔 600ms，避免 `saveAnswers` 请求乱序
 - 交卷后自动读取成绩
 
+## 注意
+
+请解压并关闭Windows安全中心后运行
+
 ## 免责声明
 
 仅供学习交流使用，请遵守平台相关规定。
