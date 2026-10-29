@@ -1,16 +1,25 @@
 /**
- * 欧倍尔自动完成课程 v8.3
- * 
- * v8.2 → v8.3 修复 (考试无法自动进入/自动完成):
- *   1. 考试入口页支持"开始答题/开始考试/进入考试/继续答题"多种按钮文案 + 自动确认弹窗
- *   2. 考试题目可能在 iframe 内: 全部查找/点击操作改为跨 frame 递归遍历
- *   3. 进入考试失败自动重试 3 轮, 并可手动点开始答题后自动接管
- *   4. 考试页识别不再只依赖 URL, 同时检测 DOM(.paperContent)
- *   5. 章节资源考试节点识别增强: 类型/标题多字段匹配(含中文"考试/试卷")
- *   6. 新增 frame 诊断日志(radio/checkbox/paper 数量), 便于定位题目所在框架
+ * 欧倍尔自动完成课程 v8.5
  *
- * v8.2:
- *   登录阶段循环检测课程, 不提前退出
+ * v8.4 → v8.5 修复 (实测定位: 答题正确但交卷没提交):
+ *   1. 根因C: 交卷确认弹窗按钮文案是 "确 定"(Ant Design 在两字按钮中间插空格),
+ *      正则 ^(确定|...)$ 匹配不到 → 弹窗一直挂着, 试卷从未真正提交.
+ *      现改为先去掉所有空白再匹配, 并轮询等待弹窗出现.
+ *   2. 根因D: 成绩正则 /(\d+)\s*分/ 会误匹配页面上的 "本试卷满分：100分",
+ *      导致没提交也显示 "考试成绩 100 分". 现改为必须匹配 "考试成绩…xx分".
+ *
+ * v8.3 → v8.4 修复 (实测定位: 无法自动进入考试):
+ *   1. 根因A: 点"开始答题"后平台要"抽题"约 1~3 分钟才跳转考试页. 旧逻辑 24s 就
+ *      重新点击, 导致反复重新抽题、永远进不去. 现改为点一次后耐心等待
+ *      (240s, 检测到抽题 loading 则延长到 420s), 期间绝不重复点击
+ *   2. 根因B: 启动器只在首次注入, 页面跳转后新文档没有脚本(CDP 的
+ *      addScriptToEvaluateOnNewDocument 随 DevTools 会话关闭而失效).
+ *      启动器 v3.2 改为按 URL 变化重新注入
+ *   3. 已在考试页(有题目)时直接答题, 不再走入口点击逻辑
+ *   4. 等待过程每 15s 输出进度, 失败时输出 frame 诊断信息
+ *
+ * v8.3:
+ *   考试入口多文案按钮 + 跨 iframe 查找 + 失败重试
  *
  * v8.0:
  *   课程列表 API 路径修复 + 可视化状态浮窗 + getHttp() 优化
@@ -46,7 +55,7 @@
       box-shadow:0 4px 20px rgba(0,0,0,0.5);
       padding:10px 12px;user-select:text;
     `;
-    el.innerHTML = `<div style="font-weight:bold;color:#722ed1;margin-bottom:6px;">🚀 欧倍尔自动完成 v8.3</div>`;
+    el.innerHTML = `<div style="font-weight:bold;color:#722ed1;margin-bottom:6px;">🚀 欧倍尔自动完成 v8.5</div>`;
     const closeBtn = document.createElement('span');
     closeBtn.textContent = '✕';
     closeBtn.style.cssText = 'float:right;cursor:pointer;color:#888;font-size:14px;';
@@ -287,22 +296,40 @@
   }
 
   // 点击"开始答题/开始考试"等入口按钮
+  // 注意: 入口是 <div class="btn"><button>开始答题</button></div>, 若把容器 div 也纳入
+  // 候选并按文档顺序取第一个, 会点到无点击事件的 div → 看起来"点了没反应".
+  // 所以优先只取真实可点击元素, 容器只作退路.
+  const START_TEXT = /开始答题|开始考试|进入考试|继续答题|开始测试|立即答题/;
   function clickStartExam() {
     const hits = eachFrame((doc) => {
-      const els = Array.from(doc.querySelectorAll('button, a, .ant-btn, [class*=start], [class*=btn]'));
-      return els.find(b => /开始答题|开始考试|进入考试|继续答题|开始测试|立即答题/.test((b.innerText || '').trim())) || null;
+      const norm = (e) => (e.innerText || '').replace(/\s+/g, '');
+      const real = Array.from(doc.querySelectorAll('button, a, .ant-btn'))
+        .find(b => !b.disabled && START_TEXT.test(norm(b)));
+      if (real) return real;
+      return Array.from(doc.querySelectorAll('[class*=start], [class*=btn]'))
+        .find(b => START_TEXT.test(norm(b))) || null;
     });
     if (hits[0]) { hits[0].click(); return true; }
     return false;
   }
 
   // 点击确认弹窗
+  // 注意: Ant Design 会在两字按钮的汉字之间插入空格 ("确 定"), 必须先去掉所有空白再匹配
   function clickConfirmDialog() {
     const hits = eachFrame((doc) => {
       const els = Array.from(doc.querySelectorAll('.ant-modal button, .ant-confirm-btns button, .ant-modal-confirm-btns button'));
-      return els.find(b => /^(确定|确认|是|继续|同意)$/.test((b.innerText || '').trim())) || null;
+      return els.find(b => /^(确定|确认|是|继续|同意|提交)$/.test((b.innerText || '').replace(/\s+/g, ''))) || null;
     });
     if (hits[0]) { hits[0].click(); return true; }
+    return false;
+  }
+
+  // 等待交卷确认弹窗出现并点击确定 (弹窗有动画延迟, 轮询若干次)
+  async function confirmSubmitDialog(times = 10, gap = 600) {
+    for (let i = 0; i < times; i++) {
+      if (clickConfirmDialog()) return true;
+      await sleep(gap);
+    }
     return false;
   }
 
@@ -316,37 +343,72 @@
   }
 
   // ====== 考试入口处理 (进入考试 + 触发答题) ======
+  // 实测: 点击"开始答题"后平台开始"抽题", 约 1~3 分钟后才在同一标签页内跳转到
+  // /theory/texam/testPaper 渲染题目. 抽题期间绝不能重复点击(会重新抽题并浪费考次),
+  // 必须耐心等待.
   async function handleExamPage() {
-    log('检测到考试页面, 尝试自动进入考试...', 'warn');
-    for (let round = 0; round < 3; round++) {
-      // 1. 最多等 12 轮(约 25 秒): 题目就绪 或 点"开始答题"
-      let clicked = false; // 每轮只点一次, 避免重复触发消耗考试次数
-      for (let i = 0; i < 12; i++) {
-        if (findExamVue()) break;
-        if (!clicked && clickStartExam()) {
-          clicked = true;
-          log('  点击"开始答题"', 'info');
+    if (findExamVue()) {
+      log('检测到考试题目, 直接开始答题...', 'warn');
+      return await autoAnswerExam();
+    }
+
+    log('检测到考试入口页, 准备进入考试...', 'warn');
+    const t0 = Date.now();
+    let clickedOnce = false;
+    let sawProgress = false;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // 只在前一次点击后长时间无任何进展时才再点一次
+      if (!clickedOnce || (!sawProgress && attempt > 0)) {
+        if (clickStartExam()) {
+          clickedOnce = true;
+          log(`  已点击"开始答题" (第${attempt + 1}次), 开始抽题...`, 'info');
           await sleep(2500);
-          if (clickConfirmDialog()) { log('  已点击确认弹窗', 'info'); await sleep(2000); }
-          continue;
+          if (clickConfirmDialog()) { log('  已点击确认弹窗', 'info'); await sleep(1500); }
+        } else {
+          log('  未找到"开始答题"按钮, 直接等待考试页加载...', 'warn');
         }
-        if (i === 2 || i === 6 || i === 10) {
-          log(`  等待考试页面加载... (${i + 1}/12)`, 'info');
-          dumpFrameInfo();
+      } else {
+        break; // 已经有进展(抽题中/URL已变), 不能再点
+      }
+
+      // 耐心等待抽题 + 跳转 (最长 240s, 一旦发现进展延长到 420s)
+      const waitStart = Date.now();
+      let lastSec = -15;
+      let budget = 240;
+      while (Date.now() - waitStart < budget * 1000) {
+        if (findExamVue()) {
+          log(`  考试题目已就绪 (总耗时 ${Math.round((Date.now() - t0) / 1000)}s)`, 'success');
+          return await autoAnswerExam();
+        }
+        // 判断是否有进展: URL 已跳到考试页 或 出现抽题 loading
+        if (!sawProgress) {
+          const p = eachFrame((doc) => {
+            const hasUrl = /texam|testPaper/i.test((() => { try { return doc.defaultView.location.href; } catch (e) { return ''; } })());
+            const hasSpin = !!doc.querySelector('.ant-spin-spinning, .ant-spin-dot, [class*=loading]');
+            const hasTip = /抽题/.test((doc.body && doc.body.innerText) || '');
+            return (hasUrl || hasSpin || hasTip) ? true : null;
+          }).length > 0;
+          if (p) { sawProgress = true; budget = 420; log('  检测到抽题/考试页加载中, 继续等待 (无需操作)', 'info'); }
+        }
+        const sec = Math.round((Date.now() - waitStart) / 1000);
+        if (sec - lastSec >= 15) {
+          lastSec = sec;
+          log(`  等待考试页加载... ${sec}s (抽题中请勿刷新页面)`, 'info');
         }
         await sleep(2000);
       }
-      // 2. 答题
-      if (!findExamVue()) {
-        log(`  第${round + 1}轮: 未找到考试题目`, 'warn');
-        await sleep(3000);
-        continue;
+
+      if (!sawProgress) {
+        log(`  等待 ${budget}s 超时, 未检测到题目`, 'warn');
+      } else {
+        log(`  抽题超时 (${budget}s), 停止等待`, 'warn');
+        break;
       }
-      if (await autoAnswerExam()) return true;
-      log(`  第${round + 1}轮答题未完成, 重试...`, 'warn');
-      await sleep(4000);
     }
-    log('❌ 自动进入考试失败: 未检测到题目, 请手动点"开始答题", 脚本会自动继续答题', 'error');
+
+    dumpFrameInfo();
+    log('❌ 自动进入考试失败: 若考试已在新标签页打开, 新标签页中的脚本会自动答题', 'error');
     return false;
   }
 
@@ -426,27 +488,33 @@
 
     // === 4. 交卷 ===
     const submitBtn = eachFrame((d) => Array.from(d.querySelectorAll('button, .ant-btn'))
-      .find(b => /交\s*卷|提交|submit/i.test((b.innerText || '').trim())) || null)[0];
+      .find(b => /交\s*卷|^\s*提交|submit$/i.test((b.innerText || '').trim())) || null)[0];
     if (!submitBtn) { log('❌ 未找到交卷按钮', 'error'); return false; }
     log('点击交卷...', 'info');
     submitBtn.click();
-    await sleep(2000);
 
-    // 确认对话框 (单次 click, 不遍历所有按钮)
-    if (clickConfirmDialog()) await sleep(2500);
+    // 确认弹窗 ("确 定": Ant Design 会在两字按钮中间插入空格, 匹配前需去掉空白)
+    if (await confirmSubmitDialog(10, 600)) log('  已点击"确定"确认交卷', 'info');
+    else log('  未出现交卷确认弹窗', 'warn');
 
-    // 查分
-    let bodyText = '';
-    try { bodyText = doc.body.innerText || ''; } catch (e) {}
-    const scoreMatch = bodyText.match(/考试成绩[^0-9]*(\d+(\.\d+)?)\s*分|(\d+(\.\d+)?)\s*分/);
-    if (scoreMatch) log(`🎉 考试成绩: ${scoreMatch[1] || scoreMatch[3]} 分!`, 'success');
+    // === 5. 等待交卷结果 (弹窗提示 "交卷成功! 本次考试成绩为100.00分") ===
+    // 注意: 不能用宽松正则, 页面上的 "本试卷满分：100分" 会误匹配
+    let score = null;
+    for (let i = 0; i < 25; i++) {
+      await sleep(1000);
+      const txt = eachFrame((d) => (d.body && d.body.innerText) || '').join('\n');
+      const m = txt.match(/考试成绩[^0-9]{0,8}(\d+(?:\.\d+)?)\s*分/);
+      if (m) { score = m[1]; break; }
+    }
+    if (score) log(`🎉 考试成绩: ${score} 分!`, 'success');
+    else log('⚠️ 已交卷, 但未读取到成绩, 请到考试入口页确认', 'warn');
     return true;
   }
 
   // ====== 主流程 ======
   async function run() {
     log('╔══════════════════════════════════════════╗', 'start');
-    log('║  🚀 欧倍尔自动完成课程 v8.3              ║', 'start');
+    log('║  🚀 欧倍尔自动完成课程 v8.5              ║', 'start');
     log('╚══════════════════════════════════════════╝', 'start');
 
     // 等 Vue $http (登录页/页面未就绪时持续等待, 不退出)

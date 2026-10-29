@@ -17,7 +17,7 @@ namespace OberyunAuto
         static void Main(string[] args)
         {
             Console.WriteLine("=========================================");
-            Console.WriteLine("  Oberyun 自动完成课程 Launcher v3.1");
+            Console.WriteLine("  Oberyun 自动完成课程 Launcher v3.2");
             Console.WriteLine("=========================================");
 
             string browserPath = FindDefaultBrowser();
@@ -49,8 +49,11 @@ namespace OberyunAuto
             string script = LoadScript();
             Console.WriteLine("[OK] Script loaded: " + (script.Length > 0 ? script.Length + " chars" : "EMPTY!"));
 
-            // Track injected tab IDs so we don't re-inject
-            var injectedTabs = new HashSet<string>();
+            // 记录每个标签页最近一次注入时的 URL: URL 变化说明发生了页面跳转,
+            // 新文档里脚本已不存在(CDP 的 addScriptToEvaluateOnNewDocument 会随
+            // DevTools 会话关闭而失效), 必须重新注入. SPA 路由变化时脚本自带
+            // __OberyunAutoRunning 防重入, 重复注入是安全的空操作.
+            var injectedUrl = new Dictionary<string, string>();
             bool everInjected = false;
 
             // Loop FOREVER: poll for oberyun tabs every 3 seconds
@@ -72,12 +75,12 @@ namespace OberyunAuto
                             int lastSlash = t.webSocketDebuggerUrl.LastIndexOf('/');
                             string tabId = lastSlash >= 0 ? t.webSocketDebuggerUrl.Substring(lastSlash + 1) : t.webSocketDebuggerUrl;
 
-                            if (injectedTabs.Contains(tabId)) continue;
+                            if (injectedUrl.ContainsKey(tabId) && injectedUrl[tabId] == t.url) continue;
 
                             Console.WriteLine("[INJECT] Tab: " + t.url.Substring(0, Math.Min(80, t.url.Length)));
                             if (InjectScript(t.webSocketDebuggerUrl, script))
                             {
-                                injectedTabs.Add(tabId);
+                                injectedUrl[tabId] = t.url;
                                 if (!everInjected)
                                 {
                                     Console.WriteLine("=========================================");
